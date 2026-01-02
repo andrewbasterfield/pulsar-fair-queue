@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/apache/pulsar-client-go/pulsar"
 	"github.com/stretchr/testify/assert"
@@ -58,6 +60,33 @@ func (m *mockPulsarProducer) Close() {
 
 var _ pulsar.Producer = (*mockPulsarProducer)(nil)
 
+type mockPulsarConsumer struct {
+	pulsar.Consumer // Embed interface
+
+	receiveFunc func(context.Context) (pulsar.Message, error)
+	ackFunc     func(pulsar.Message) error
+}
+
+func (m *mockPulsarConsumer) Receive(ctx context.Context) (pulsar.Message, error) {
+	if m.receiveFunc != nil {
+		return m.receiveFunc(ctx)
+	}
+	return nil, nil
+}
+
+func (m *mockPulsarConsumer) Ack(msg pulsar.Message) error {
+	if m.ackFunc != nil {
+		return m.ackFunc(msg)
+	}
+	return nil
+}
+
+func (m *mockPulsarConsumer) Close() {
+	// No-op
+}
+
+var _ pulsar.Consumer = (*mockPulsarConsumer)(nil)
+
 // --- Tests ---
 
 func TestPulsarQueueImpl_Producer_Send(t *testing.T) {
@@ -86,7 +115,7 @@ func TestPulsarQueueImpl_Producer_Send(t *testing.T) {
 				assert.Equal(t, subName, options.SubscriptionName)
 				assert.Equal(t, pulsar.Shared, options.Type)
 				assert.Equal(t, pulsar.SubscriptionPositionEarliest, options.SubscriptionInitialPosition)
-				return nil, nil // Consumer not used
+				return &mockPulsarConsumer{}, nil
 			},
 			createProducerFunc: func(options pulsar.ProducerOptions) (pulsar.Producer, error) {
 				createProducerCalled = true
@@ -95,7 +124,7 @@ func TestPulsarQueueImpl_Producer_Send(t *testing.T) {
 			},
 		}
 
-		pq := NewPulsarQueueImpl(mockCli, queueName, subName)
+		pq := NewPulsarQueueImpl(mockCli, queueName, subName, time.Second)
 		producer := pq.Producer()
 
 		messages := []*pulsar.ProducerMessage{{Payload: []byte("test")}}
@@ -116,7 +145,7 @@ func TestPulsarQueueImpl_Producer_Send(t *testing.T) {
 		}
 		mockCli := &mockPulsarClient{
 			subscribeFunc: func(options pulsar.ConsumerOptions) (pulsar.Consumer, error) {
-				return nil, nil
+				return &mockPulsarConsumer{}, nil
 			},
 			createProducerFunc: func(options pulsar.ProducerOptions) (pulsar.Producer, error) {
 				createProducerCalls++
@@ -124,7 +153,7 @@ func TestPulsarQueueImpl_Producer_Send(t *testing.T) {
 			},
 		}
 
-		pq := NewPulsarQueueImpl(mockCli, queueName, subName)
+		pq := NewPulsarQueueImpl(mockCli, queueName, subName, time.Second)
 		producer := pq.Producer()
 		messages := []*pulsar.ProducerMessage{{Payload: []byte("test")}}
 
@@ -137,10 +166,6 @@ func TestPulsarQueueImpl_Producer_Send(t *testing.T) {
 	})
 
 	t.Run("Subscribe error is logged but not fatal", func(t *testing.T) {
-		// Note: Since we capture stdout for logging check, or just verify it doesn't return error
-		// The code prints to fmt.Printf. We won't assert on stdout here easily,
-		// but we assert that the function continues.
-
 		mockProd := &mockPulsarProducer{
 			sendFunc: func(ctx context.Context, msg *pulsar.ProducerMessage) (pulsar.MessageID, error) {
 				return nil, nil
@@ -155,7 +180,7 @@ func TestPulsarQueueImpl_Producer_Send(t *testing.T) {
 			},
 		}
 
-		pq := NewPulsarQueueImpl(mockCli, queueName, subName)
+		pq := NewPulsarQueueImpl(mockCli, queueName, subName, time.Second)
 		producer := pq.Producer()
 		messages := []*pulsar.ProducerMessage{{Payload: []byte("test")}}
 
@@ -166,14 +191,14 @@ func TestPulsarQueueImpl_Producer_Send(t *testing.T) {
 	t.Run("CreateProducer error returns error", func(t *testing.T) {
 		mockCli := &mockPulsarClient{
 			subscribeFunc: func(options pulsar.ConsumerOptions) (pulsar.Consumer, error) {
-				return nil, nil
+				return &mockPulsarConsumer{}, nil
 			},
 			createProducerFunc: func(options pulsar.ProducerOptions) (pulsar.Producer, error) {
 				return nil, errors.New("create producer failed")
 			},
 		}
 
-		pq := NewPulsarQueueImpl(mockCli, queueName, subName)
+		pq := NewPulsarQueueImpl(mockCli, queueName, subName, time.Second)
 		producer := pq.Producer()
 		messages := []*pulsar.ProducerMessage{{Payload: []byte("test")}}
 
@@ -190,14 +215,14 @@ func TestPulsarQueueImpl_Producer_Send(t *testing.T) {
 		}
 		mockCli := &mockPulsarClient{
 			subscribeFunc: func(options pulsar.ConsumerOptions) (pulsar.Consumer, error) {
-				return nil, nil
+				return &mockPulsarConsumer{}, nil
 			},
 			createProducerFunc: func(options pulsar.ProducerOptions) (pulsar.Producer, error) {
 				return mockProd, nil
 			},
 		}
 
-		pq := NewPulsarQueueImpl(mockCli, queueName, subName)
+		pq := NewPulsarQueueImpl(mockCli, queueName, subName, time.Second)
 		producer := pq.Producer()
 		messages := []*pulsar.ProducerMessage{{Payload: []byte("test")}}
 
@@ -205,4 +230,163 @@ func TestPulsarQueueImpl_Producer_Send(t *testing.T) {
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "send failed")
 	})
+}
+
+func TestPulsarQueueImpl_Consumer(t *testing.T) {
+	queueName := "test-queue"
+	subName := "test-sub"
+
+	t.Run("Wildcard consumer", func(t *testing.T) {
+		subscribeCalled := false
+		expectedTopicPattern := "test-queue-*"
+
+		mockCons := &mockPulsarConsumer{
+			receiveFunc: func(ctx context.Context) (pulsar.Message, error) {
+				return nil, nil
+			},
+		}
+
+		mockCli := &mockPulsarClient{
+			subscribeFunc: func(options pulsar.ConsumerOptions) (pulsar.Consumer, error) {
+				subscribeCalled = true
+				assert.Equal(t, expectedTopicPattern, options.TopicsPattern)
+				assert.Equal(t, subName, options.SubscriptionName)
+				assert.Equal(t, pulsar.Shared, options.Type)
+				assert.Equal(t, pulsar.SubscriptionPositionEarliest, options.SubscriptionInitialPosition)
+				return mockCons, nil
+			},
+		}
+
+		pq := NewPulsarQueueImpl(mockCli, queueName, subName, time.Second)
+		consumer := pq.Consumer(nil)
+		assert.NotNil(t, consumer)
+		assert.True(t, subscribeCalled)
+	})
+
+	t.Run("Specific message class consumer", func(t *testing.T) {
+		subscribeCalled := false
+		msgClass := "classA"
+		expectedTopicPattern := "test-queue-classA"
+
+		mockCons := &mockPulsarConsumer{
+			receiveFunc: func(ctx context.Context) (pulsar.Message, error) {
+				return nil, nil
+			},
+		}
+
+		mockCli := &mockPulsarClient{
+			subscribeFunc: func(options pulsar.ConsumerOptions) (pulsar.Consumer, error) {
+				subscribeCalled = true
+				assert.Equal(t, expectedTopicPattern, options.TopicsPattern)
+				return mockCons, nil
+			},
+		}
+
+		pq := NewPulsarQueueImpl(mockCli, queueName, subName, time.Second)
+		consumer := pq.Consumer(&msgClass)
+		assert.NotNil(t, consumer)
+		assert.True(t, subscribeCalled)
+	})
+
+	t.Run("Receive calls underlying consumer", func(t *testing.T) {
+		receiveCalled := false
+		mockCons := &mockPulsarConsumer{
+			receiveFunc: func(ctx context.Context) (pulsar.Message, error) {
+				receiveCalled = true
+				return nil, nil
+			},
+		}
+		mockCli := &mockPulsarClient{
+			subscribeFunc: func(options pulsar.ConsumerOptions) (pulsar.Consumer, error) {
+				return mockCons, nil
+			},
+		}
+
+		pq := NewPulsarQueueImpl(mockCli, queueName, subName, time.Second)
+		consumer := pq.Consumer(nil)
+		_, err := consumer.Receive(context.Background())
+
+		assert.NoError(t, err)
+		assert.True(t, receiveCalled)
+	})
+
+	t.Run("Receive error is propagated", func(t *testing.T) {
+		mockCons := &mockPulsarConsumer{
+			receiveFunc: func(ctx context.Context) (pulsar.Message, error) {
+				return nil, errors.New("receive failed")
+			},
+		}
+		mockCli := &mockPulsarClient{
+			subscribeFunc: func(options pulsar.ConsumerOptions) (pulsar.Consumer, error) {
+				return mockCons, nil
+			},
+		}
+
+		pq := NewPulsarQueueImpl(mockCli, queueName, subName, time.Second)
+		consumer := pq.Consumer(nil)
+		_, err := consumer.Receive(context.Background())
+
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "receive failed")
+	})
+
+	t.Run("Ack calls underlying consumer", func(t *testing.T) {
+		ackCalled := false
+		mockCons := &mockPulsarConsumer{
+			ackFunc: func(msg pulsar.Message) error {
+				ackCalled = true
+				return nil
+			},
+		}
+		mockCli := &mockPulsarClient{
+			subscribeFunc: func(options pulsar.ConsumerOptions) (pulsar.Consumer, error) {
+				return mockCons, nil
+			},
+		}
+
+		pq := NewPulsarQueueImpl(mockCli, queueName, subName, time.Second)
+		consumer := pq.Consumer(nil)
+		err := consumer.Ack(nil) // msg can be nil for this test as mock ignores it
+
+		assert.NoError(t, err)
+		assert.True(t, ackCalled)
+	})
+}
+
+func TestConcurrent_producer_usage(t *testing.T) {
+	queueName := "test-queue"
+	subName := "test-sub"
+	msgClass := "classA"
+
+	mockProd := &mockPulsarProducer{
+		sendFunc: func(ctx context.Context, msg *pulsar.ProducerMessage) (pulsar.MessageID, error) {
+			return nil, nil
+		},
+	}
+	mockCli := &mockPulsarClient{
+		subscribeFunc: func(options pulsar.ConsumerOptions) (pulsar.Consumer, error) {
+			return &mockPulsarConsumer{}, nil
+		},
+		createProducerFunc: func(options pulsar.ProducerOptions) (pulsar.Producer, error) {
+			return mockProd, nil
+		},
+	}
+
+	pq := NewPulsarQueueImpl(mockCli, queueName, subName, time.Second)
+	producer := pq.Producer()
+	messages := []*pulsar.ProducerMessage{{Payload: []byte("test")}}
+
+	var wg sync.WaitGroup
+	concurrency := 10
+	wg.Add(concurrency)
+
+	for i := 0; i < concurrency; i++ {
+		go func() {
+			defer wg.Done()
+			err := producer.Send(context.Background(), messages, msgClass)
+			assert.NoError(t, err)
+		}()
+	}
+
+	wg.Wait()
 }

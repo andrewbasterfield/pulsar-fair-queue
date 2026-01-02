@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
+	"sync"
+	"time"
 
 	"github.com/apache/pulsar-client-go/pulsar"
 	_ "github.com/apache/pulsar-client-go/pulsar"
@@ -11,7 +13,9 @@ import (
 // PulsarQueueConsumer defines the interface for consuming messages from a Pulsar queue.
 type PulsarQueueConsumer interface {
 	// Receive method blocks until a message is available to be received.
-	Receive() (pulsar.Message, error)
+	Receive(ctx context.Context) (pulsar.Message, error)
+	// Ack acknowledges a single message.
+	Ack(msg pulsar.Message) error
 }
 
 // PulsarQueueProducer defines the interface for producing messages to Pulsar topics.
@@ -42,12 +46,17 @@ type pulsarQueueConsumerImpl struct {
 
 // Receive method retrieves a single message from the consumer.
 // It blocks until a message is available or an error occurs.
-func (c pulsarQueueConsumerImpl) Receive() (pulsar.Message, error) {
-	msg, err := c.consumer.Receive(context.Background())
+func (c pulsarQueueConsumerImpl) Receive(ctx context.Context) (pulsar.Message, error) {
+	msg, err := c.consumer.Receive(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to receive message: %v", err)
 	}
 	return msg, nil
+}
+
+// Ack acknowledges a single message.
+func (c pulsarQueueConsumerImpl) Ack(msg pulsar.Message) error {
+	return c.consumer.Ack(msg)
 }
 
 var _ PulsarQueueConsumer = (*pulsarQueueConsumerImpl)(nil)
@@ -55,9 +64,10 @@ var _ PulsarQueueConsumer = (*pulsarQueueConsumerImpl)(nil)
 // PulsarQueueImpl implements the PulsarQueue interface, providing a client for interacting with Pulsar.
 // It manages the underlying Pulsar client and configuration for a specific queue and subscription.
 type PulsarQueueImpl struct {
-	client           pulsar.Client // The underlying Pulsar client instance.
-	queueName        string        // The base name of the queue.
-	subscriptionName string        // The name of the subscription to use for consumers and for ensuring producer subscriptions.
+	client              pulsar.Client // The underlying Pulsar client instance.
+	queueName           string        // The base name of the queue.
+	subscriptionName    string        // The name of the subscription to use for consumers and for ensuring producer subscriptions.
+	autoDiscoveryPeriod time.Duration // The interval to poll for new topics.
 }
 
 // Producer returns a PulsarQueueProducer for sending messages.
@@ -72,12 +82,13 @@ func (q PulsarQueueImpl) Producer() PulsarQueueProducer {
 }
 
 // NewPulsarQueueImpl creates a new instance of PulsarQueueImpl.
-// It initializes the queue with the provided Pulsar client, queue name, and subscription name.
-func NewPulsarQueueImpl(client pulsar.Client, queueName string, subscriptionName string) *PulsarQueueImpl {
+// It initializes the queue with the provided Pulsar client, queue name, subscription name, and auto-discovery period.
+func NewPulsarQueueImpl(client pulsar.Client, queueName string, subscriptionName string, autoDiscoveryPeriod time.Duration) *PulsarQueueImpl {
 	return &PulsarQueueImpl{
-		client:           client,
-		queueName:        queueName,
-		subscriptionName: subscriptionName,
+		client:              client,
+		queueName:           queueName,
+		subscriptionName:    subscriptionName,
+		autoDiscoveryPeriod: autoDiscoveryPeriod,
 	}
 }
 
@@ -91,6 +102,7 @@ type pulsarQueueProducerImpl struct {
 	queueName        string                     // The base name of the queue.
 	subscriptionName string                     // The name of the subscription used by consumers.
 	producers        map[string]pulsar.Producer // A map of topicName to Pulsar Producer instances.
+	mu               sync.RWMutex               // Mutex to protect the producers map.
 }
 
 // Send sends a batch of messages to a Pulsar topic determined by the messageClass.
@@ -99,35 +111,49 @@ type pulsarQueueProducerImpl struct {
 func (p *pulsarQueueProducerImpl) Send(ctx context.Context, messages []*pulsar.ProducerMessage, messageClass string) error {
 	topicName := fmt.Sprintf(TopicQueueFormat, p.queueName, messageClass)
 
-	// Ensure a subscription exists for the topic before producing.
-	// This helps prevent data loss with aggressive retention policies.
-	// The Subscribe call will create the topic and subscription if they don't exist.
-	// We do not need to actively use the returned consumer, only ensure its creation.
-	_, err := p.client.Subscribe(pulsar.ConsumerOptions{
-		Topic:                       topicName,
-		SubscriptionName:            p.subscriptionName,
-		Type:                        pulsar.Shared,                       // Use Shared subscription type for fair queueing.
-		SubscriptionInitialPosition: pulsar.SubscriptionPositionEarliest, // Start consuming from the earliest message.
-	})
-	if err != nil {
-		// Log a warning if subscription creation/lookup fails but continue,
-		// as the subscription might already exist, and the client might
-		// return a non-fatal error in such cases. In a production system,
-		// more robust error handling and type checking might be necessary.
-		fmt.Printf("Warning: Failed to ensure subscription for topic %s: %v\n", topicName, err)
-	}
-
-	// Retrieve or create a producer for the specific topic.
+	// Retrieve producer with read lock
+	p.mu.RLock()
 	producer, ok := p.producers[topicName]
+	p.mu.RUnlock()
+
 	if !ok {
-		newProducer, err := p.client.CreateProducer(pulsar.ProducerOptions{
-			Topic: topicName, // Associate producer with the specific topic.
-		})
-		if err != nil {
-			return fmt.Errorf("failed to create producer for topic %s: %v", topicName, err)
+		// Acquire write lock to create producer
+		p.mu.Lock()
+		// Double check if producer was created while waiting for lock
+		producer, ok = p.producers[topicName]
+		if !ok {
+			// Ensure a subscription exists for the topic before producing.
+			// This helps prevent data loss with aggressive retention policies.
+			// The Subscribe call will create the topic and subscription if they don't exist.
+			// We do not need to actively use the returned consumer, only ensure its creation.
+			consumer, err := p.client.Subscribe(pulsar.ConsumerOptions{
+				Topic:                       topicName,
+				SubscriptionName:            p.subscriptionName,
+				Type:                        pulsar.Shared,                       // Use Shared subscription type for fair queueing.
+				SubscriptionInitialPosition: pulsar.SubscriptionPositionEarliest, // Start consuming from the earliest message.
+			})
+			if err != nil {
+				// Log a warning if subscription creation/lookup fails but continue,
+				// as the subscription might already exist, and the client might
+				// return a non-fatal error in such cases.
+				fmt.Printf("Warning: Failed to ensure subscription for topic %s: %v\n", topicName, err)
+			} else {
+				// Close the consumer immediately as we only needed to ensure the subscription existed.
+				// This prevents leaking consumers/connections.
+				consumer.Close()
+			}
+
+			newProducer, err := p.client.CreateProducer(pulsar.ProducerOptions{
+				Topic: topicName, // Associate producer with the specific topic.
+			})
+			if err != nil {
+				p.mu.Unlock() // Release lock on error
+				return fmt.Errorf("failed to create producer for topic %s: %v", topicName, err)
+			}
+			producer = newProducer
+			p.producers[topicName] = producer // Store the new producer for reuse.
 		}
-		producer = newProducer
-		p.producers[topicName] = producer // Store the new producer for reuse.
+		p.mu.Unlock()
 	}
 
 	// Send each message in the batch.
@@ -162,6 +188,7 @@ func (q PulsarQueueImpl) Consumer(messageClass *string) PulsarQueueConsumer {
 	opts.SubscriptionName = q.subscriptionName                             // Use the predefined subscription name.
 	opts.Type = pulsar.Shared                                              // Use a Shared subscription to allow multiple consumers.
 	opts.SubscriptionInitialPosition = pulsar.SubscriptionPositionEarliest // Start consuming from the earliest available message.
+	opts.AutoDiscoveryPeriod = q.autoDiscoveryPeriod                       // Set topic discovery interval.
 
 	consumer, err := q.client.Subscribe(opts)
 
