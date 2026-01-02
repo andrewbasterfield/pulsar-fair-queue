@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math/rand"
 	"os"
 	"os/signal"
 	"sync"
@@ -20,18 +21,53 @@ var (
 	url       = flag.String("url", "pulsar://localhost:6650", "Pulsar URL")
 	queueName = flag.String("queue", "persistent://public/queues/queue", "Queue name")
 	subName   = flag.String("sub", "fair-subscription", "Subscription name")
-	msgClass  = flag.String("class", "foo", "Message class for production")
+	msgClass  = flag.String("class", "foo", "Message class prefix for production")
 	count     = flag.Int("count", 1000, "Total messages to produce")
 	batchSize = flag.Int("batch", 10, "Messages per batch")
 	workers   = flag.Int("workers", 1, "Number of concurrent workers")
-	discovery = flag.Int("discovery", 1000, "Topic discovery interval in milliseconds")
+	discovery = flag.Int("discovery", 1, "Topic discovery interval in seconds")
+	numTopics = flag.Int("topics", 1, "Number of unique topics (message classes) to distribute across")
 )
 
-func consume(ctx context.Context, queue PulsarQueueConsumer, wg *sync.WaitGroup, id int) {
+type Stats struct {
+	sentMessages     uint64
+	receivedMessages uint64
+}
+
+func reportStats(ctx context.Context, stats *Stats) {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	var lastSent, lastReceived uint64
+	startTime := time.Now()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			currSent := atomic.LoadUint64(&stats.sentMessages)
+			currReceived := atomic.LoadUint64(&stats.receivedMessages)
+
+			rateSent := float64(currSent - lastSent)
+			rateReceived := float64(currReceived - lastReceived)
+
+			elapsed := time.Since(startTime).Seconds()
+			avgSent := float64(currSent) / elapsed
+			avgReceived := float64(currReceived) / elapsed
+
+			log.Printf("Stats: Sent %d (%.1f/s), Received %d (%.1f/s) | Avg: %.1f sent/s, %.1f recv/s",
+				currSent, rateSent, currReceived, rateReceived, avgSent, avgReceived)
+
+			lastSent = currSent
+			lastReceived = currReceived
+		}
+	}
+}
+
+func consume(ctx context.Context, queue PulsarQueueConsumer, wg *sync.WaitGroup, id int, stats *Stats) {
 	defer wg.Done()
 	log.Printf("[Consumer-%d] Started", id)
-
-	var receivedCount uint64
 
 	for {
 		if ctx.Err() != nil {
@@ -50,20 +86,21 @@ func consume(ctx context.Context, queue PulsarQueueConsumer, wg *sync.WaitGroup,
 			if err := queue.Ack(msg); err != nil {
 				log.Printf("[Consumer-%d] Failed to ack: %v", id, err)
 			} else {
-				newCount := atomic.AddUint64(&receivedCount, 1)
-				if newCount%100 == 0 {
-					log.Printf("[Consumer-%d] Processed %d messages", id, newCount)
-				}
+				atomic.AddUint64(&stats.receivedMessages, 1)
 			}
 		}
 	}
 }
 
-func produce(ctx context.Context, producer PulsarQueueProducer, wg *sync.WaitGroup, id int, totalMessages int, batchSize int) {
+func produce(ctx context.Context, queue PulsarQueue, wg *sync.WaitGroup, id int, totalMessages int, batchSize int, stats *Stats) {
 	defer wg.Done()
 	log.Printf("[Producer-%d] Started, producing %d messages in batches of %d", id, totalMessages, batchSize)
 
+	producer := queue.Producer()
 	sentCount := 0
+
+	// Local random source to avoid lock contention
+	r := rand.New(rand.NewSource(time.Now().UnixNano() + int64(id)))
 
 	for sentCount < totalMessages {
 		if ctx.Err() != nil {
@@ -75,6 +112,13 @@ func produce(ctx context.Context, producer PulsarQueueProducer, wg *sync.WaitGro
 			currentBatch = totalMessages - sentCount
 		}
 
+		// Determine message class (topic)
+		className := *msgClass
+		if *numTopics > 1 {
+			classID := r.Intn(*numTopics)
+			className = fmt.Sprintf("%s-%d", *msgClass, classID)
+		}
+
 		messages := make([]*pulsar.ProducerMessage, 0, currentBatch)
 		for i := 0; i < currentBatch; i++ {
 			payload := fmt.Sprintf("msg-%d-%d", id, sentCount+i)
@@ -83,14 +127,15 @@ func produce(ctx context.Context, producer PulsarQueueProducer, wg *sync.WaitGro
 			})
 		}
 
-		err := producer.Send(ctx, messages, *msgClass)
+		err := producer.Send(ctx, messages, className)
 		if err != nil {
-			log.Printf("[Producer-%d] Error sending batch: %v", id, err)
+			log.Printf("[Producer-%d] Error sending batch to %s: %v", id, className, err)
 			if ctx.Err() != nil {
 				return
 			}
 		} else {
 			sentCount += currentBatch
+			atomic.AddUint64(&stats.sentMessages, uint64(currentBatch))
 		}
 	}
 	log.Printf("[Producer-%d] Completed. Sent %d messages.", id, sentCount)
@@ -111,15 +156,19 @@ func main() {
 	}
 	defer client.Close()
 
-	queue := NewPulsarQueueImpl(client, *queueName, *subName, time.Duration(*discovery)*time.Millisecond)
+	queue := NewPulsarQueueImpl(client, *queueName, *subName, time.Duration(*discovery)*time.Second)
 
 	var wg sync.WaitGroup
+	stats := &Stats{}
+
+	// Start stats reporter
+	go reportStats(ctx, stats)
 
 	// Consumers
 	if *mode == "consume" || *mode == "both" {
 		for i := 0; i < *workers; i++ {
 			wg.Add(1)
-			go consume(ctx, queue.Consumer(nil), &wg, i)
+			go consume(ctx, queue.Consumer(nil), &wg, i, stats)
 		}
 	}
 
@@ -132,7 +181,7 @@ func main() {
 
 		for i := 0; i < *workers; i++ {
 			wg.Add(1)
-			go produce(ctx, queue.Producer(), &wg, i, msgsPerWorker, *batchSize)
+			go produce(ctx, queue, &wg, i, msgsPerWorker, *batchSize, stats)
 		}
 	}
 

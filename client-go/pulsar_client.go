@@ -41,21 +41,30 @@ const TopicQueueFormat = "%s-%s"
 
 // pulsarQueueConsumerImpl implements the PulsarQueueConsumer interface using the Pulsar client library.
 type pulsarQueueConsumerImpl struct {
-	consumer pulsar.Consumer // The underlying Pulsar consumer instance.
+	consumer     pulsar.Consumer // The underlying Pulsar consumer instance.
+	lastActivity map[string]time.Time
+	mu           sync.RWMutex
 }
 
 // Receive method retrieves a single message from the consumer.
 // It blocks until a message is available or an error occurs.
-func (c pulsarQueueConsumerImpl) Receive(ctx context.Context) (pulsar.Message, error) {
+func (c *pulsarQueueConsumerImpl) Receive(ctx context.Context) (pulsar.Message, error) {
 	msg, err := c.consumer.Receive(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to receive message: %v", err)
 	}
+
+	if msg != nil {
+		c.mu.Lock()
+		c.lastActivity[msg.Topic()] = time.Now()
+		c.mu.Unlock()
+	}
+
 	return msg, nil
 }
 
 // Ack acknowledges a single message.
-func (c pulsarQueueConsumerImpl) Ack(msg pulsar.Message) error {
+func (c *pulsarQueueConsumerImpl) Ack(msg pulsar.Message) error {
 	return c.consumer.Ack(msg)
 }
 
@@ -198,6 +207,7 @@ func (q PulsarQueueImpl) Consumer(messageClass *string) PulsarQueueConsumer {
 	}
 
 	return &pulsarQueueConsumerImpl{
-		consumer: consumer, // Return a new consumer wrapper.
+		consumer:     consumer, // Return a new consumer wrapper.
+		lastActivity: make(map[string]time.Time),
 	}
 }
