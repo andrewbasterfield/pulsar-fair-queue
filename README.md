@@ -90,3 +90,13 @@ The consumer relies on a `Shared` subscription (configured in `consume.sh`). Thi
 
 ### Verdict
 The project is a solid Proof of Concept (PoC) for dynamic fair queueing. It works as intended but requires disciplined producer behavior (always ensure subscription exists) to be production-safe.
+
+## Go Client Limitations
+
+The Go client implementation encounters specific issues with infinite resurrection of topics deleted due to inactivity.
+
+Research indicates this is because the Go client does not currently support **server-side filtering** for regex subscriptions, a feature introduced in **PIP-145: Improve performance of regex subscriptions**. This functionality is currently only fully supported in the **Java client**.
+
+*   **References**: [PIP-145 Issue #14505](https://github.com/apache/pulsar/issues/14505) [Improving Regular Expression-Based Subscriptions in Pulsar Consumers](https://streamnative.io/blog/improving-regular-expression-based-subscriptions-pulsar-consumers)
+*   **Problem**: The Go client relies on **client-side filtering**, where it actively polls the broker for all topics, filters them locally, and manages individual connections. When a topic is deleted by the broker (due to inactivity policy), the client detects the connection loss and immediately attempts to reconnect, inadvertently triggering **Auto-Topic Creation** and resurrecting the topic.
+*   **Solution (PIP-145)**: PIP-145 introduces `CommandWatchTopicList` and server-side filtering, allowing the broker to manage the topic list and push updates to the client. This would allow the broker to stop routing messages for a deleted topic without the client needing to maintain (and thus resurrect) a connection to it.
