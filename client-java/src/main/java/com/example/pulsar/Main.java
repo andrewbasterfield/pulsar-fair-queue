@@ -1,6 +1,8 @@
 package com.example.pulsar;
 
 import java.io.PrintStream;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import org.apache.pulsar.client.api.PulsarClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -115,6 +117,9 @@ public class Main {
                     // Acknowledge the entire batch before incrementing the stats
                     consumer.ack(messages);
                     stats.receivedMessages.addAndGet(messages.size());
+                    for (var message : messages) {
+                        stats.topicCounts.merge(message.getTopicName(), 1L, Long::sum);
+                    }
                 }
             }
         } catch (Exception e) {
@@ -213,6 +218,7 @@ public class Main {
     static class Stats {
         AtomicLong sentMessages = new AtomicLong(0);
         AtomicLong receivedMessages = new AtomicLong(0);
+        Map<String, Long> topicCounts = new ConcurrentHashMap<>();
     }
 
     private static ScheduledExecutorService startStatsReporter(Stats stats) {
@@ -229,10 +235,11 @@ public class Main {
             double rateSent = currSent - lastSent[0];
             double rateReceived = currReceived - lastReceived[0];
             
-            log.info("Stats: Sent {} ({}/s), Received {} ({}/s) | Avg: {} sent/s, {} recv/s",
+            log.info("Stats: Sent {} ({}/s), Received {} ({}/s) | Avg: {} sent/s, {} recv/s | Topics: {}",
                     currSent, rateSent, currReceived, rateReceived,
                     String.format("%.1f", currSent / elapsed),
-                    String.format("%.1f", currReceived / elapsed));
+                    String.format("%.1f", currReceived / elapsed),
+                    stats.topicCounts.size());
             
             lastSent[0] = currSent;
             lastReceived[0] = currReceived;
