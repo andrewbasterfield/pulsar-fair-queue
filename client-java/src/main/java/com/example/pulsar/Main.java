@@ -1,6 +1,6 @@
 package com.example.pulsar;
 
-import org.apache.pulsar.client.api.Message;
+import java.io.PrintStream;
 import org.apache.pulsar.client.api.PulsarClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -22,12 +22,12 @@ public class Main {
     private static String url = "pulsar://localhost:6650";
     private static String queueName = "persistent://public/queues/queue";
     private static String subName = "fair-subscription";
-    private static String msgClass = "foo";
+    private static String classSubTopicPrefix = "foo";
     private static int count = 1000;
     private static int batchSize = 10;
     private static int workers = 1;
     private static int discovery = 60;
-    private static int numTopics = 1;
+    private static int numClassSubTopics = 1;
     private static int maxProducerCreationAttempts = 3;
     private static int maxProducerSendAttempts = 3;
     private static int maxConsumerBatchSize = 100; // New parameter for batch consumption
@@ -36,7 +36,7 @@ public class Main {
         parseArgs(args);
 
         log.info("Starting with config: mode={}, url={}, queue={}, sub={}, class={}, topics={}, maxProducerCreationAttempts={}, maxProducerSendAttempts={}, maxConsumerBatchMessages={}",
-                mode, url, queueName, subName, msgClass, numTopics, maxProducerCreationAttempts, maxProducerSendAttempts,
+                mode, url, queueName, subName, classSubTopicPrefix, numClassSubTopics, maxProducerCreationAttempts, maxProducerSendAttempts,
             maxConsumerBatchSize);
 
         try (PulsarClient client = PulsarClient.builder().serviceUrl(url).build()) {
@@ -62,7 +62,7 @@ public class Main {
                 int msgsPerWorker = count / workers;
                 if (msgsPerWorker == 0) msgsPerWorker = 1;
 
-                List<String> topicSuffixes = generateTopicSuffixes(numTopics);
+                List<String> topicSuffixes = generateTopicSuffixes(numClassSubTopics);
 
                 for (int i = 0; i < workers; i++) {
                     int id = i;
@@ -112,8 +112,9 @@ public class Main {
                 // Receive messages in batches
                 var messages = consumer.receiveBatch();
                 if (messages != null && messages.size() > 0) {
+                    // Acknowledge the entire batch before incrementing the stats
+                    consumer.ack(messages);
                     stats.receivedMessages.addAndGet(messages.size());
-                    consumer.ack(messages); // Acknowledge the entire batch
                 }
             }
         } catch (Exception e) {
@@ -130,10 +131,10 @@ public class Main {
             while (sentCount < totalMessages) {
                 int currentBatch = Math.min(batchSize, totalMessages - sentCount);
                 
-                String className = msgClass;
-                if (numTopics > 1) {
-                    String suffix = topicSuffixes.get(r.nextInt(numTopics));
-                    className = String.format("%s-%s", msgClass, suffix);
+                String className = classSubTopicPrefix;
+                if (numClassSubTopics > 1) {
+                    String suffix = topicSuffixes.get(r.nextInt(numClassSubTopics));
+                    className = String.format("%s-%s", classSubTopicPrefix, suffix);
                 }
 
                 List<String> batch = new ArrayList<>(currentBatch);
@@ -153,20 +154,60 @@ public class Main {
 
     private static void parseArgs(String[] args) {
         for (String arg : args) {
-            if (arg.startsWith("--mode=")) mode = arg.split("=")[1];
-            if (arg.startsWith("--url=")) url = arg.split("=")[1];
-            if (arg.startsWith("--queue=")) queueName = arg.split("=")[1];
-            if (arg.startsWith("--sub=")) subName = arg.split("=")[1];
-            if (arg.startsWith("--class=")) msgClass = arg.split("=")[1];
-            if (arg.startsWith("--count=")) count = Integer.parseInt(arg.split("=")[1]);
-            if (arg.startsWith("--batch=")) batchSize = Integer.parseInt(arg.split("=")[1]);
-            if (arg.startsWith("--workers=")) workers = Integer.parseInt(arg.split("=")[1]);
-            if (arg.startsWith("--discovery=")) discovery = Integer.parseInt(arg.split("=")[1]);
-            if (arg.startsWith("--topics=")) numTopics = Integer.parseInt(arg.split("=")[1]);
-            if (arg.startsWith("--max-producer-creation-attempts=")) maxProducerCreationAttempts = Integer.parseInt(arg.split("=")[1]);
-            if (arg.startsWith("--max-producer-send-attempts=")) maxProducerSendAttempts = Integer.parseInt(arg.split("=")[1]);
-            if (arg.startsWith("--max-consumer-batch-messages=")) maxConsumerBatchSize = Integer.parseInt(arg.split("=")[1]);
+            if (arg.startsWith("--mode=")) {
+                mode = arg.split("=")[1];
+            } else if (arg.startsWith("--url=")) {
+                url = arg.split("=")[1];
+            } else if (arg.startsWith("--queue=")) {
+                queueName = arg.split("=")[1];
+            } else if (arg.startsWith("--sub=")) {
+                subName = arg.split("=")[1];
+            } else if (arg.startsWith("--class-sub-topic-prefix=")) {
+                classSubTopicPrefix = arg.split("=")[1];
+            } else if (arg.startsWith("--count=")) {
+                count = Integer.parseInt(arg.split("=")[1]);
+            } else if (arg.startsWith("--batch=")) {
+                batchSize = Integer.parseInt(arg.split("=")[1]);
+            } else if (arg.startsWith("--workers=")) {
+                workers = Integer.parseInt(arg.split("=")[1]);
+            } else if (arg.startsWith("--discovery=")) {
+                discovery = Integer.parseInt(arg.split("=")[1]);
+            } else if (arg.startsWith("--class-sub-topics=")) {
+                numClassSubTopics = Integer.parseInt(arg.split("=")[1]);
+            } else if (arg.startsWith("--max-producer-creation-attempts=")) {
+                maxProducerCreationAttempts = Integer.parseInt(arg.split("=")[1]);
+            } else if (arg.startsWith("--max-producer-send-attempts=")) {
+                maxProducerSendAttempts = Integer.parseInt(arg.split("=")[1]);
+            } else if (arg.startsWith("--max-consumer-batch-messages=")) {
+                maxConsumerBatchSize = Integer.parseInt(arg.split("=")[1]);
+            } else if (arg.equals("--help")) {
+                printUsage(System.out);
+                System.exit(0);
+            } else {
+                log.warn("Unknown argument: {}", arg);
+                printUsage(System.err);
+                System.exit(1);
+            }
         }
+    }
+
+    private static void printUsage(PrintStream ps) {
+        ps.println("Usage: java -jar client.jar [options]");
+        ps.println("Options:");
+        ps.println("  --mode=<mode>                                 Mode of operation: produce, consume, both (default: " + mode + ")");
+        ps.println("  --url=<url>                                   Pulsar service URL (default: " + url + ")");
+        ps.println("  --queue=<queue>                               Queue name (default: " + queueName + ")");
+        ps.println("  --sub=<subName>                               Subscription name (default: " + subName + ")");
+        ps.println("  --class-sub-topic-prefix=<prefix>             Prefix for class sub-topics (default: " + classSubTopicPrefix + ")");
+        ps.println("  --count=<count>                               Total number of messages to produce (default: " + count + ")");
+        ps.println("  --batch=<batchSize>                           Producer batch size (default: " + batchSize + ")");
+        ps.println("  --workers=<workers>                           Number of worker threads (default: " + workers + ")");
+        ps.println("  --discovery=<seconds>                         Discovery interval in seconds (default: " + discovery + ")");
+        ps.println("  --class-sub-topics=<num>                      Number of class sub-topics (default: " + numClassSubTopics + ")");
+        ps.println("  --max-producer-creation-attempts=<attempts>   Max attempts to create a producer (default: " + maxProducerCreationAttempts + ")");
+        ps.println("  --max-producer-send-attempts=<attempts>       Max attempts to send a message (default: " + maxProducerSendAttempts + ")");
+        ps.println("  --max-consumer-batch-messages=<size>          Max messages per consumer batch (default: " + maxConsumerBatchSize + ")");
+        ps.println("  --help                                        Show this help message");
     }
 
     static class Stats {
