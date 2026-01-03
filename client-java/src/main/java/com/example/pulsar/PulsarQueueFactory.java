@@ -6,7 +6,7 @@ import org.apache.pulsar.client.api.PulsarClient;
 import java.time.Duration;
 
 public class PulsarQueueFactory {
-    public static PulsarQueue create(PulsarClient client, String queueName, String subscriptionName, Duration autoDiscoveryPeriod, int maxProducerCreationAttempts, int maxProducerSendAttempts) {
-        return new PulsarQueueImpl(client, queueName, subscriptionName, autoDiscoveryPeriod, maxProducerCreationAttempts, maxProducerSendAttempts);
+    public static PulsarQueue create(PulsarClient client, String queueName, String subscriptionName, Duration autoDiscoveryPeriod, int maxProducerCreationAttempts, int maxProducerSendAttempts, int maxConsumerBatchSize) {
+        return new PulsarQueueImpl(client, queueName, subscriptionName, autoDiscoveryPeriod, maxProducerCreationAttempts, maxProducerSendAttempts, maxConsumerBatchSize);
     }
 }

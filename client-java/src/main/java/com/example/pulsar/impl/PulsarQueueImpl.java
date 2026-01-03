@@ -26,6 +26,7 @@ public class PulsarQueueImpl implements PulsarQueue {
     private final Duration autoDiscoveryPeriod;
     private final int maxProducerCreationAttempts;
     private final int maxProducerSendAttempts;
+    private final int maxConsumerBatchSize;
 
     // Matches TopicQueueFormat in Go: "%s-%s"
     static final String TOPIC_QUEUE_FORMAT = "%s-%s";
@@ -39,13 +40,14 @@ public class PulsarQueueImpl implements PulsarQueue {
      * @param autoDiscoveryPeriod The interval for discovering new topics (used for pattern auto-discovery fallback).
      * @param maxProducerCreationAttempts  The maximum number of attempts for producer creation.
      */
-    public PulsarQueueImpl(PulsarClient client, String queueName, String subscriptionName, Duration autoDiscoveryPeriod, int maxProducerCreationAttempts, int maxProducerSendAttempts) {
+    public PulsarQueueImpl(PulsarClient client, String queueName, String subscriptionName, Duration autoDiscoveryPeriod, int maxProducerCreationAttempts, int maxProducerSendAttempts, int maxConsumerBatchSize) {
         this.client = client;
         this.queueName = queueName;
         this.subscriptionName = subscriptionName;
         this.autoDiscoveryPeriod = autoDiscoveryPeriod;
         this.maxProducerCreationAttempts = maxProducerCreationAttempts;
         this.maxProducerSendAttempts = maxProducerSendAttempts;
+        this.maxConsumerBatchSize = maxConsumerBatchSize;
     }
 
     /**
@@ -91,6 +93,8 @@ public class PulsarQueueImpl implements PulsarQueue {
                 // endlessly trying to reconnect and accidentally resurrecting the topic.
                 builder.subscriptionTopicsMode(RegexSubscriptionMode.PersistentOnly);
             }
+
+            builder.batchReceivePolicy(BatchReceivePolicy.builder().maxNumMessages(maxConsumerBatchSize).build());
 
             Consumer<byte[]> consumer = builder.subscribe();
             return new PulsarQueueConsumerImpl(consumer);

@@ -30,16 +30,18 @@ public class Main {
     private static int numTopics = 1;
     private static int maxProducerCreationAttempts = 3;
     private static int maxProducerSendAttempts = 3;
+    private static int maxConsumerBatchSize = 100; // New parameter for batch consumption
 
     public static void main(String[] args) {
         parseArgs(args);
 
-        log.info("Starting with config: mode={}, url={}, queue={}, sub={}, class={}, topics={}, maxProducerCreationAttempts={}, maxProducerSendAttempts={}",
-                mode, url, queueName, subName, msgClass, numTopics, maxProducerCreationAttempts, maxProducerSendAttempts);
+        log.info("Starting with config: mode={}, url={}, queue={}, sub={}, class={}, topics={}, maxProducerCreationAttempts={}, maxProducerSendAttempts={}, maxConsumerBatchMessages={}",
+                mode, url, queueName, subName, msgClass, numTopics, maxProducerCreationAttempts, maxProducerSendAttempts,
+            maxConsumerBatchSize);
 
         try (PulsarClient client = PulsarClient.builder().serviceUrl(url).build()) {
             PulsarQueue queue = PulsarQueueFactory.create(client, queueName, subName, Duration.ofSeconds(discovery),
-                maxProducerCreationAttempts, maxProducerSendAttempts);
+                maxProducerCreationAttempts, maxProducerSendAttempts, maxConsumerBatchSize);
             
             Stats stats = new Stats();
             ScheduledExecutorService scheduler = startStatsReporter(stats);
@@ -107,10 +109,11 @@ public class Main {
         log.info("[Consumer-{}] Started", id);
         try (PulsarQueueConsumer consumer = queue.createConsumer(null)) {
             while (true) {
-                var msg = consumer.receive();
-                if (msg != null) {
-                    consumer.ack(msg);
-                    stats.receivedMessages.incrementAndGet();
+                // Receive messages in batches
+                var messages = consumer.receiveBatch();
+                if (messages != null && messages.size() > 0) {
+                    stats.receivedMessages.addAndGet(messages.size());
+                    consumer.ack(messages); // Acknowledge the entire batch
                 }
             }
         } catch (Exception e) {
@@ -160,8 +163,9 @@ public class Main {
             if (arg.startsWith("--workers=")) workers = Integer.parseInt(arg.split("=")[1]);
             if (arg.startsWith("--discovery=")) discovery = Integer.parseInt(arg.split("=")[1]);
             if (arg.startsWith("--topics=")) numTopics = Integer.parseInt(arg.split("=")[1]);
-            if (arg.startsWith("--maxProducerCreationAttempts=")) maxProducerCreationAttempts = Integer.parseInt(arg.split("=")[1]);
-            if (arg.startsWith("--maxProducerSendAttempts=")) maxProducerSendAttempts = Integer.parseInt(arg.split("=")[1]);
+            if (arg.startsWith("--max-producer-creation-attempts=")) maxProducerCreationAttempts = Integer.parseInt(arg.split("=")[1]);
+            if (arg.startsWith("--max-producer-send-attempts=")) maxProducerSendAttempts = Integer.parseInt(arg.split("=")[1]);
+            if (arg.startsWith("--max-consumer-batch-messages=")) maxConsumerBatchSize = Integer.parseInt(arg.split("=")[1]);
         }
     }
 

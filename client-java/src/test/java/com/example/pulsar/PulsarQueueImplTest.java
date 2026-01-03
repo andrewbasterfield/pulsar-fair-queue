@@ -66,7 +66,7 @@ class PulsarQueueImplTest {
         lenient().when(producer.sendAsync(any())).thenReturn(java.util.concurrent.CompletableFuture.completedFuture(mock(MessageId.class)));
 
         // Default to 3 attempts, matching the default in PulsarQueueFactory
-        pulsarQueue = new PulsarQueueImpl(pulsarClient, queueName, subName, Duration.ofSeconds(1), 3, 3);
+        pulsarQueue = new PulsarQueueImpl(pulsarClient, queueName, subName, Duration.ofSeconds(1), 3, 3, 0);
     }
 
     @Test
@@ -126,7 +126,7 @@ class PulsarQueueImplTest {
     @Test
     void testProducerCreationFailureAfterRetries() throws PulsarClientException {
         // We need to create a new PulsarQueue instance that uses a specific number of attempts for this test
-        PulsarQueueImpl testPulsarQueue = new PulsarQueueImpl(pulsarClient, queueName, subName, Duration.ofSeconds(1), 3, 3);
+        PulsarQueueImpl testPulsarQueue = new PulsarQueueImpl(pulsarClient, queueName, subName, Duration.ofSeconds(1), 3, 3, 0);
 
         // Simulate producer creation failure
         when(producerBuilder.create()).thenThrow(new PulsarClientException("Producer creation failed"));
@@ -177,6 +177,23 @@ class PulsarQueueImplTest {
         queueConsumer.receive();
         verify(consumer).receive();
     }
+
+    @Test
+    void testConsumerBatchReceive() throws PulsarClientException {
+        PulsarQueueConsumer queueConsumer = pulsarQueue.createConsumer(null);
+
+        // Mock a Messages object for batch receive
+        Messages<byte[]> mockMessages = mock(Messages.class);
+        when(mockMessages.size()).thenReturn(3); // Simulate receiving 3 messages
+        when(consumer.batchReceive()).thenReturn(mockMessages);
+
+        Messages<byte[]> receivedMessages = queueConsumer.receiveBatch();
+
+        verify(consumer).batchReceive();
+        assertNotNull(receivedMessages);
+        assertEquals(3, receivedMessages.size());
+    }
+
 
     @Test
     void testConsumerAck() throws PulsarClientException {
