@@ -49,15 +49,24 @@ class PulsarQueueImplTest {
         lenient().when(consumerBuilder.subscriptionInitialPosition(any())).thenReturn(consumerBuilder);
         lenient().when(consumerBuilder.autoUpdatePartitions(anyBoolean())).thenReturn(consumerBuilder);
         lenient().when(consumerBuilder.autoUpdatePartitionsInterval(anyInt(), any())).thenReturn(consumerBuilder);
+        lenient().when(consumerBuilder.patternAutoDiscoveryPeriod(anyInt(), any())).thenReturn(consumerBuilder);
         lenient().when(consumerBuilder.topic(anyString())).thenReturn(consumerBuilder);
         lenient().when(consumerBuilder.topicsPattern(any(Pattern.class))).thenReturn(consumerBuilder);
         lenient().when(consumerBuilder.subscriptionTopicsMode(any())).thenReturn(consumerBuilder);
         lenient().when(consumerBuilder.subscribe()).thenReturn(consumer);
 
         lenient().when(producerBuilder.topic(anyString())).thenReturn(producerBuilder);
+        lenient().when(producerBuilder.enableBatching(anyBoolean())).thenReturn(producerBuilder);
+        lenient().when(producerBuilder.batchingMaxPublishDelay(anyLong(), any())).thenReturn(producerBuilder);
+        lenient().when(producerBuilder.sendTimeout(anyInt(), any())).thenReturn(producerBuilder);
+        lenient().when(producerBuilder.compressionType(any())).thenReturn(producerBuilder);
+        lenient().when(producerBuilder.blockIfQueueFull(anyBoolean())).thenReturn(producerBuilder);
         lenient().when(producerBuilder.create()).thenReturn(producer);
 
-        pulsarQueue = new PulsarQueueImpl(pulsarClient, queueName, subName, Duration.ofSeconds(1));
+        lenient().when(producer.sendAsync(any())).thenReturn(java.util.concurrent.CompletableFuture.completedFuture(mock(MessageId.class)));
+
+        // Default to 3 attempts, matching the default in PulsarQueueFactory
+        pulsarQueue = new PulsarQueueImpl(pulsarClient, queueName, subName, Duration.ofSeconds(1), 3, 3);
     }
 
     @Test
@@ -76,8 +85,9 @@ class PulsarQueueImplTest {
 
         // Verify producer creation and send
         verify(producerBuilder).topic(expectedTopic);
+        verify(producerBuilder).sendTimeout(60, TimeUnit.SECONDS);
         verify(producerBuilder).create();
-        verify(producer).send("msg1".getBytes());
+        verify(producer).sendAsync("msg1".getBytes());
     }
 
     @Test
@@ -94,7 +104,7 @@ class PulsarQueueImplTest {
         // Should only create producer once
         verify(producerBuilder, times(1)).create();
         // Should send twice
-        verify(producer, times(2)).send(any());
+        verify(producer, times(2)).sendAsync(any());
     }
 
     @Test
@@ -110,8 +120,31 @@ class PulsarQueueImplTest {
 
         // Verify it still attempted to create producer and send
         verify(producerBuilder).create();
-        verify(producer).send(any());
+        verify(producer).sendAsync(any());
     }
+
+    @Test
+    void testProducerCreationFailureAfterRetries() throws PulsarClientException {
+        // We need to create a new PulsarQueue instance that uses a specific number of attempts for this test
+        PulsarQueueImpl testPulsarQueue = new PulsarQueueImpl(pulsarClient, queueName, subName, Duration.ofSeconds(1), 3, 3);
+
+        // Simulate producer creation failure
+        when(producerBuilder.create()).thenThrow(new PulsarClientException("Producer creation failed"));
+
+        PulsarQueueProducer queueProducer = testPulsarQueue.createProducer();
+        String msgClass = "classA";
+
+        // Should throw RuntimeException wrapping the PulsarClientException
+        RuntimeException exception = assertThrows(RuntimeException.class, () -> 
+            queueProducer.send(Collections.singletonList("msg"), msgClass)
+        );
+        assertTrue(exception.getMessage().contains("Failed to create producer"));
+        assertTrue(exception.getCause() instanceof PulsarClientException);
+
+        // Verify attempts (3 attempts)
+        verify(producerBuilder, times(3)).create();
+    }
+
 
     @Test
     void testWildcardConsumer() throws PulsarClientException {
@@ -177,6 +210,6 @@ class PulsarQueueImplTest {
         // Verify producer was created only once despite concurrent access
         verify(producerBuilder, times(1)).create();
         // Verify send was called 10 times
-        verify(producer, times(threads)).send(any());
+        verify(producer, times(threads)).sendAsync(any());
     }
 }

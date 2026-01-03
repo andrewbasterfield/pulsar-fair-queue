@@ -24,6 +24,8 @@ public class PulsarQueueImpl implements PulsarQueue {
     private final String queueName;
     private final String subscriptionName;
     private final Duration autoDiscoveryPeriod;
+    private final int maxProducerCreationAttempts;
+    private final int maxProducerSendAttempts;
 
     // Matches TopicQueueFormat in Go: "%s-%s"
     static final String TOPIC_QUEUE_FORMAT = "%s-%s";
@@ -35,12 +37,15 @@ public class PulsarQueueImpl implements PulsarQueue {
      * @param queueName           The base name of the queue (e.g., "persistent://public/queues/queue").
      * @param subscriptionName    The shared subscription name to use for all consumers.
      * @param autoDiscoveryPeriod The interval for discovering new topics (used for pattern auto-discovery fallback).
+     * @param maxProducerCreationAttempts  The maximum number of attempts for producer creation.
      */
-    public PulsarQueueImpl(PulsarClient client, String queueName, String subscriptionName, Duration autoDiscoveryPeriod) {
+    public PulsarQueueImpl(PulsarClient client, String queueName, String subscriptionName, Duration autoDiscoveryPeriod, int maxProducerCreationAttempts, int maxProducerSendAttempts) {
         this.client = client;
         this.queueName = queueName;
         this.subscriptionName = subscriptionName;
         this.autoDiscoveryPeriod = autoDiscoveryPeriod;
+        this.maxProducerCreationAttempts = maxProducerCreationAttempts;
+        this.maxProducerSendAttempts = maxProducerSendAttempts;
     }
 
     /**
@@ -97,7 +102,7 @@ public class PulsarQueueImpl implements PulsarQueue {
 
     @Override
     public PulsarQueueProducer createProducer() {
-        return new PulsarQueueProducerImpl(client, queueName, subscriptionName);
+      return new PulsarQueueProducerImpl(client, queueName, subscriptionName,
+          maxProducerCreationAttempts, maxProducerSendAttempts);
     }
-
 }

@@ -1,5 +1,6 @@
 package com.example.pulsar;
 
+import org.apache.pulsar.client.api.Message;
 import org.apache.pulsar.client.api.PulsarClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -27,18 +28,21 @@ public class Main {
     private static int workers = 1;
     private static int discovery = 60;
     private static int numTopics = 1;
+    private static int maxProducerCreationAttempts = 3;
+    private static int maxProducerSendAttempts = 3;
 
     public static void main(String[] args) {
         parseArgs(args);
 
-        log.info("Starting with config: mode={}, url={}, queue={}, sub={}, class={}, topics={}",
-                mode, url, queueName, subName, msgClass, numTopics);
+        log.info("Starting with config: mode={}, url={}, queue={}, sub={}, class={}, topics={}, maxProducerCreationAttempts={}, maxProducerSendAttempts={}",
+                mode, url, queueName, subName, msgClass, numTopics, maxProducerCreationAttempts, maxProducerSendAttempts);
 
         try (PulsarClient client = PulsarClient.builder().serviceUrl(url).build()) {
-            PulsarQueue queue = PulsarQueueFactory.create(client, queueName, subName, Duration.ofSeconds(discovery));
+            PulsarQueue queue = PulsarQueueFactory.create(client, queueName, subName, Duration.ofSeconds(discovery),
+                maxProducerCreationAttempts, maxProducerSendAttempts);
             
             Stats stats = new Stats();
-            startStatsReporter(stats);
+            ScheduledExecutorService scheduler = startStatsReporter(stats);
 
             ExecutorService executor = Executors.newCachedThreadPool();
             List<Runnable> tasks = new ArrayList<>();
@@ -76,6 +80,7 @@ public class Main {
                 if (executor.awaitTermination(1, TimeUnit.HOURS)) {
                     log.info("Production complete");
                 }
+                scheduler.shutdownNow(); // Shut down the stats reporter
             } else {
                 // Keep running until interrupted
                 synchronized (Main.class) {
@@ -155,6 +160,8 @@ public class Main {
             if (arg.startsWith("--workers=")) workers = Integer.parseInt(arg.split("=")[1]);
             if (arg.startsWith("--discovery=")) discovery = Integer.parseInt(arg.split("=")[1]);
             if (arg.startsWith("--topics=")) numTopics = Integer.parseInt(arg.split("=")[1]);
+            if (arg.startsWith("--maxProducerCreationAttempts=")) maxProducerCreationAttempts = Integer.parseInt(arg.split("=")[1]);
+            if (arg.startsWith("--maxProducerSendAttempts=")) maxProducerSendAttempts = Integer.parseInt(arg.split("=")[1]);
         }
     }
 
@@ -163,7 +170,7 @@ public class Main {
         AtomicLong receivedMessages = new AtomicLong(0);
     }
 
-    private static void startStatsReporter(Stats stats) {
+    private static ScheduledExecutorService startStatsReporter(Stats stats) {
         ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
         final long[] lastSent = {0};
         final long[] lastReceived = {0};
@@ -185,5 +192,6 @@ public class Main {
             lastSent[0] = currSent;
             lastReceived[0] = currReceived;
         }, 1, 1, TimeUnit.SECONDS);
+        return scheduler;
     }
 }
