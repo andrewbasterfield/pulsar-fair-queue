@@ -196,6 +196,25 @@ class PulsarQueueImplTest {
 
 
     @Test
+    void testConsumerBatchReceiveWithTimeout() throws PulsarClientException, java.util.concurrent.ExecutionException, InterruptedException, java.util.concurrent.TimeoutException {
+        PulsarQueueConsumer queueConsumer = pulsarQueue.createConsumer(null);
+
+        // Mock a Messages object for batch receive
+        Messages<byte[]> mockMessages = mock(Messages.class);
+        when(mockMessages.size()).thenReturn(5);
+
+        // Mock batchReceiveAsync
+        java.util.concurrent.CompletableFuture<Messages<byte[]>> future = java.util.concurrent.CompletableFuture.completedFuture(mockMessages);
+        when(consumer.batchReceiveAsync()).thenReturn(future);
+
+        Messages<byte[]> receivedMessages = queueConsumer.receiveBatch(1, TimeUnit.SECONDS);
+
+        verify(consumer).batchReceiveAsync();
+        assertNotNull(receivedMessages);
+        assertEquals(5, receivedMessages.size());
+    }
+
+    @Test
     void testConsumerAck() throws PulsarClientException {
         PulsarQueueConsumer queueConsumer = pulsarQueue.createConsumer(null);
         Message<?> msg = mock(Message.class);
@@ -228,5 +247,50 @@ class PulsarQueueImplTest {
         verify(producerBuilder, times(1)).create();
         // Verify send was called 10 times
         verify(producer, times(threads)).sendAsync(any());
+    }    @Test
+    void testProducerPartialFailureRetry() throws PulsarClientException {
+        // Use default setup which has 3 retries
+        PulsarQueueProducer queueProducer = pulsarQueue.createProducer();
+        String msgClass = "retryClass";
+        List<String> messages = java.util.Arrays.asList("msg1", "msg2", "msg3");
+
+        java.util.Map<String, java.util.concurrent.atomic.AtomicInteger> attempts = new java.util.HashMap<>();
+        attempts.put("msg1", new java.util.concurrent.atomic.AtomicInteger(0));
+        attempts.put("msg2", new java.util.concurrent.atomic.AtomicInteger(0));
+        attempts.put("msg3", new java.util.concurrent.atomic.AtomicInteger(0));
+
+        when(producer.sendAsync(any(byte[].class))).thenAnswer(invocation -> {
+            String msg = new String((byte[]) invocation.getArgument(0));
+            int count = attempts.get(msg).incrementAndGet();
+
+            if (msg.equals("msg1")) return java.util.concurrent.CompletableFuture.completedFuture(mock(MessageId.class));
+
+            if (msg.equals("msg2")) {
+                if (count == 1) {
+                    java.util.concurrent.CompletableFuture<MessageId> f = new java.util.concurrent.CompletableFuture<>();
+                    f.completeExceptionally(new PulsarClientException("Fail msg2 attempt 1"));
+                    return f;
+                }
+                return java.util.concurrent.CompletableFuture.completedFuture(mock(MessageId.class));
+            }
+
+            if (msg.equals("msg3")) {
+                if (count <= 2) {
+                    java.util.concurrent.CompletableFuture<MessageId> f = new java.util.concurrent.CompletableFuture<>();
+                    f.completeExceptionally(new PulsarClientException("Fail msg3 attempt " + count));
+                    return f;
+                }
+                return java.util.concurrent.CompletableFuture.completedFuture(mock(MessageId.class));
+            }
+            return java.util.concurrent.CompletableFuture.completedFuture(mock(MessageId.class));
+        });
+
+        assertDoesNotThrow(() -> queueProducer.send(messages, msgClass));
+
+        // msg1: sent 1 time (success)
+        // msg2: sent 2 times (fail, success)
+        // msg3: sent 3 times (fail, fail, success)
+        // Total invocations: 1 + 2 + 3 = 6
+        verify(producer, times(6)).sendAsync(any());
     }
 }

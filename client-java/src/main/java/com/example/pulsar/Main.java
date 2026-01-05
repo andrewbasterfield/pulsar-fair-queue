@@ -3,6 +3,8 @@ package com.example.pulsar;
 import java.io.PrintStream;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import org.apache.pulsar.client.api.Messages;
 import org.apache.pulsar.client.api.PulsarClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -16,6 +18,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class Main {
     private static final Logger log = LoggerFactory.getLogger(Main.class);
@@ -32,65 +35,81 @@ public class Main {
     private static int numClassSubTopics = 1;
     private static int maxProducerCreationAttempts = 3;
     private static int maxProducerSendAttempts = 3;
-    private static int maxConsumerBatchSize = 100; // New parameter for batch consumption
-
+    private static int maxConsumerBatchSize = 100;
+    private static int consumerIdleTimeout = 0;
+    
     public static void main(String[] args) {
         parseArgs(args);
 
-        log.info("Starting with config: mode={}, url={}, queue={}, sub={}, class={}, topics={}, maxProducerCreationAttempts={}, maxProducerSendAttempts={}, maxConsumerBatchMessages={}",
+        log.info("Starting with config: mode={}, url={}, queue={}, sub={}, class={}, topics={}, maxProducerCreationAttempts={}, maxProducerSendAttempts={}, maxConsumerBatchMessages={}, consumerIdleTimeout={}",
                 mode, url, queueName, subName, classSubTopicPrefix, numClassSubTopics, maxProducerCreationAttempts, maxProducerSendAttempts,
-            maxConsumerBatchSize);
+            maxConsumerBatchSize, consumerIdleTimeout);
 
         try (PulsarClient client = PulsarClient.builder().serviceUrl(url).build()) {
             PulsarQueue queue = PulsarQueueFactory.create(client, queueName, subName, Duration.ofSeconds(discovery),
                 maxProducerCreationAttempts, maxProducerSendAttempts, maxConsumerBatchSize);
             
             Stats stats = new Stats();
-            ScheduledExecutorService scheduler = startStatsReporter(stats);
+            long startTime = System.currentTimeMillis();
+            ScheduledExecutorService scheduler = startStatsReporter(stats, startTime);
 
             ExecutorService executor = Executors.newCachedThreadPool();
+            AtomicBoolean shutdownCalled = new AtomicBoolean(false);
+
+            Runnable shutdownTask = () -> {
+                if (shutdownCalled.compareAndSet(false, true)) {
+                    log.info("Shutting down...");
+                    executor.shutdownNow();
+                    scheduler.shutdownNow();
+                    printStatsSummary(stats, startTime);
+                }
+            };
+
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                log.info("Received SIGINT, triggering shutdown...");
+                shutdownTask.run();
+            }));
+
             List<Runnable> tasks = new ArrayList<>();
 
             // Consumers
             if ("consume".equals(mode) || "both".equals(mode)) {
                 for (int i = 0; i < workers; i++) {
                     int id = i;
-                    tasks.add(() -> consume(queue, id, stats));
+                    // We will wrap the task creation to pass the latch later or use a custom Runnable
+                    // For now, let's create the latch based on expected count.
                 }
             }
 
-            // Producers
-            if ("produce".equals(mode) || "both".equals(mode)) {
+            // Consumers
+            int consumerCount = ("consume".equals(mode) || "both".equals(mode)) ? workers : 0;
+            int producerCount = ("produce".equals(mode) || "both".equals(mode)) ? workers : 0;
+
+            CountDownLatch latch = new CountDownLatch(consumerCount + producerCount);
+
+            if (consumerCount > 0) {
+                 for (int i = 0; i < consumerCount; i++) {
+                    int id = i;
+                    executor.submit(() -> consume(queue, id, stats, latch));
+                }
+            }
+
+            if (producerCount > 0) {
                 int msgsPerWorker = count / workers;
                 if (msgsPerWorker == 0) msgsPerWorker = 1;
-
                 List<String> topicSuffixes = generateTopicSuffixes(numClassSubTopics);
 
-                for (int i = 0; i < workers; i++) {
+                for (int i = 0; i < producerCount; i++) {
                     int id = i;
                     int finalMsgsPerWorker = msgsPerWorker;
-                    tasks.add(() -> produce(queue, id, finalMsgsPerWorker, batchSize, stats, topicSuffixes));
+                    executor.submit(() -> produce(queue, id, finalMsgsPerWorker, batchSize, stats, topicSuffixes, latch));
                 }
-            }
-            
-            // Execute all tasks
-            for (Runnable task : tasks) {
-                executor.submit(task);
             }
 
-            // Wait logic
-            if ("produce".equals(mode)) {
-                executor.shutdown();
-                if (executor.awaitTermination(1, TimeUnit.HOURS)) {
-                    log.info("Production complete");
-                }
-                scheduler.shutdownNow(); // Shut down the stats reporter
-            } else {
-                // Keep running until interrupted
-                synchronized (Main.class) {
-                    Main.class.wait();
-                }
-            }
+            // Wait for all tasks to complete
+            latch.await();
+            log.info("All tasks completed.");
+            shutdownTask.run();
 
         } catch (Exception e) {
             log.error("Error in main", e);
@@ -100,60 +119,94 @@ public class Main {
     private static List<String> generateTopicSuffixes(int count) {
         List<String> suffixes = new ArrayList<>(count);
         for (int i = 0; i < count; i++) {
-             // Generate a random 7-char hex string (like a git shortref)
              String suffix = java.util.UUID.randomUUID().toString().replace("-", "").substring(0, 7);
              suffixes.add(suffix);
         }
         return suffixes;
     }
 
-    private static void consume(PulsarQueue queue, int id, Stats stats) {
+    private static void consume(PulsarQueue queue, int id, Stats stats, CountDownLatch latch) {
         log.info("[Consumer-{}] Started", id);
-        try (PulsarQueueConsumer consumer = queue.createConsumer(null)) {
-            while (true) {
-                // Receive messages in batches
-                var messages = consumer.receiveBatch();
-                if (messages != null && messages.size() > 0) {
-                    // Acknowledge the entire batch before incrementing the stats
-                    consumer.ack(messages);
-                    stats.receivedMessages.addAndGet(messages.size());
-                    for (var message : messages) {
-                        stats.topicCounts.merge(message.getTopicName(), 1L, Long::sum);
+        try {
+            while (!Thread.currentThread().isInterrupted()) {
+                boolean shouldRetry = true;
+                try (PulsarQueueConsumer consumer = queue.createConsumer(null)) {
+                    log.info("[Consumer-{}] Connected to {}", id, queueName);
+                    long lastMessageTime = System.currentTimeMillis();
+                    while (!Thread.currentThread().isInterrupted()) {
+                        Messages<byte[]> messages;
+                        if (consumerIdleTimeout > 0) {
+                            messages = consumer.receiveBatch(1, TimeUnit.SECONDS); 
+                            if (messages == null && (System.currentTimeMillis() - lastMessageTime) > (consumerIdleTimeout * 1000L)) {
+                                log.info("[Consumer-{}] Idle for {} seconds, shutting down.", id, consumerIdleTimeout);
+                                shouldRetry = false;
+                                break; 
+                            }
+                        } else {
+                            messages = consumer.receiveBatch();
+                        }
+
+                        if (messages != null && messages.size() > 0) {
+                            lastMessageTime = System.currentTimeMillis();
+                            consumer.ack(messages);
+                            stats.receivedMessages.addAndGet(messages.size());
+                            for (var message : messages) {
+                                stats.receivedTopicsCounts.merge(message.getTopicName(), 1L, Long::sum);
+                            }
+                        }
+                    }
+                } catch (Exception e) {
+                    log.error("[Consumer-{}] Error, retrying in 5s...", id, e);
+                    try {
+                        TimeUnit.SECONDS.sleep(5);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        break;
                     }
                 }
+                
+                if (!shouldRetry) {
+                    break;
+                }
             }
-        } catch (Exception e) {
-            log.error("[Consumer-{}] Error", id, e);
+        } finally {
+            log.info("[Consumer-{}] Stopped", id);
+            latch.countDown();
         }
     }
 
-    private static void produce(PulsarQueue queue, int id, int totalMessages, int batchSize, Stats stats, List<String> topicSuffixes) {
+    private static void produce(PulsarQueue queue, int id, int totalMessages, int batchSize, Stats stats, List<String> topicSuffixes, CountDownLatch latch) {
         log.info("[Producer-{}] Started, producing {} messages", id, totalMessages);
-        try (PulsarQueueProducer producer = queue.createProducer()) {
-            int sentCount = 0;
-            Random r = new Random(System.nanoTime() + id);
+        try {
+            try (PulsarQueueProducer producer = queue.createProducer()) {
+                int sentCount = 0;
+                Random r = new Random(System.nanoTime() + id);
 
-            while (sentCount < totalMessages) {
-                int currentBatch = Math.min(batchSize, totalMessages - sentCount);
-                
-                String className = classSubTopicPrefix;
-                if (numClassSubTopics > 1) {
-                    String suffix = topicSuffixes.get(r.nextInt(numClassSubTopics));
-                    className = String.format("%s-%s", classSubTopicPrefix, suffix);
+                while (sentCount < totalMessages) {
+                    int currentBatch = Math.min(batchSize, totalMessages - sentCount);
+                    
+                    String className = classSubTopicPrefix;
+                    if (numClassSubTopics > 1) {
+                        String suffix = topicSuffixes.get(r.nextInt(numClassSubTopics));
+                        className = String.format("%s-%s", classSubTopicPrefix, suffix);
+                    }
+
+                    List<String> batch = new ArrayList<>(currentBatch);
+                    for (int i = 0; i < currentBatch; i++) {
+                        batch.add(String.format("msg-%d-%d", id, sentCount + i));
+                    }
+
+                    producer.send(batch, className);
+                    sentCount += currentBatch;
+                    stats.sentMessages.addAndGet(currentBatch);
+                    stats.sentTopicsCount.merge(className, (long) currentBatch, Long::sum);
                 }
-
-                List<String> batch = new ArrayList<>(currentBatch);
-                for (int i = 0; i < currentBatch; i++) {
-                    batch.add(String.format("msg-%d-%d", id, sentCount + i));
-                }
-
-                producer.send(batch, className);
-                sentCount += currentBatch;
-                stats.sentMessages.addAndGet(currentBatch);
+                log.info("[Producer-{}] Completed. Sent {} messages.", id, sentCount);
+            } catch (Exception e) {
+                log.error("[Producer-{}] Error", id, e);
             }
-            log.info("[Producer-{}] Completed. Sent {} messages.", id, sentCount);
-        } catch (Exception e) {
-            log.error("[Producer-{}] Error", id, e);
+        } finally {
+            latch.countDown();
         }
     }
 
@@ -185,6 +238,8 @@ public class Main {
                 maxProducerSendAttempts = Integer.parseInt(arg.split("=")[1]);
             } else if (arg.startsWith("--max-consumer-batch-messages=")) {
                 maxConsumerBatchSize = Integer.parseInt(arg.split("=")[1]);
+            } else if (arg.startsWith("--consumer-idle-timeout-seconds=")) {
+                consumerIdleTimeout = Integer.parseInt(arg.split("=")[1]);
             } else if (arg.equals("--help")) {
                 printUsage(System.out);
                 System.exit(0);
@@ -212,38 +267,55 @@ public class Main {
         ps.println("  --max-producer-creation-attempts=<attempts>   Max attempts to create a producer (default: " + maxProducerCreationAttempts + ")");
         ps.println("  --max-producer-send-attempts=<attempts>       Max attempts to send a message (default: " + maxProducerSendAttempts + ")");
         ps.println("  --max-consumer-batch-messages=<size>          Max messages per consumer batch (default: " + maxConsumerBatchSize + ")");
+        ps.println("  --consumer-idle-timeout-seconds=<seconds>     Consumer idle timeout in seconds (0 to disable, default: " + consumerIdleTimeout + ")");
         ps.println("  --help                                        Show this help message");
     }
 
     static class Stats {
         AtomicLong sentMessages = new AtomicLong(0);
         AtomicLong receivedMessages = new AtomicLong(0);
-        Map<String, Long> topicCounts = new ConcurrentHashMap<>();
+        Map<String, Long> sentTopicsCount = new ConcurrentHashMap<>();
+        Map<String, Long> receivedTopicsCounts = new ConcurrentHashMap<>();
     }
 
-    private static ScheduledExecutorService startStatsReporter(Stats stats) {
+    private static ScheduledExecutorService startStatsReporter(Stats stats, long startTime) {
         ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
-        final long[] lastSent = {0};
-        final long[] lastReceived = {0};
-        final long startTime = System.currentTimeMillis();
+        final AtomicLong lastSent = new AtomicLong(0);
+        final AtomicLong lastReceived = new AtomicLong(0);
 
         scheduler.scheduleAtFixedRate(() -> {
-            long currSent = stats.sentMessages.get();
-            long currReceived = stats.receivedMessages.get();
-            
-            double elapsed = (System.currentTimeMillis() - startTime) / 1000.0;
-            double rateSent = currSent - lastSent[0];
-            double rateReceived = currReceived - lastReceived[0];
-            
-            log.info("Stats: Sent {} ({}/s), Received {} ({}/s) | Avg: {} sent/s, {} recv/s | Topics: {}",
-                    currSent, rateSent, currReceived, rateReceived,
-                    String.format("%.1f", currSent / elapsed),
-                    String.format("%.1f", currReceived / elapsed),
-                    stats.topicCounts.size());
-            
-            lastSent[0] = currSent;
-            lastReceived[0] = currReceived;
+            printStats(stats, lastSent, lastReceived, startTime);
         }, 1, 1, TimeUnit.SECONDS);
         return scheduler;
+    }
+
+    private static void printStats(Stats stats, final AtomicLong lastSent, final AtomicLong lastReceived, final long startTime) {
+        long currSent = stats.sentMessages.get();
+        long currReceived = stats.receivedMessages.get();
+
+        double elapsed = (System.currentTimeMillis() - startTime) / 1000.0;
+        double rateSent = currSent - lastSent.getAndSet(currSent);
+        double rateReceived = currReceived - lastReceived.getAndSet(currReceived);
+
+        log.info("Stats: Sent {} ({}/s), Received {} ({}/s) | Avg: {} sent/s, {} recv/s | Topics: {}",
+                currSent, rateSent, currReceived, rateReceived,
+                String.format("%.1f", currSent / elapsed),
+                String.format("%.1f", currReceived / elapsed),
+                stats.receivedTopicsCounts.size());
+    }
+
+    private static void printStatsSummary(Stats stats, long startTime) {
+        long currSent = stats.sentMessages.get();
+        long currReceived = stats.receivedMessages.get();
+        double elapsed = (System.currentTimeMillis() - startTime) / 1000.0;
+
+        stats.sentTopicsCount.forEach((topic, count) -> log.info("Topic '{}' sent {} messages", topic, count));
+        stats.receivedTopicsCounts.forEach((topic, count) -> log.info("Topic '{}' received {} messages", topic, count));
+
+        log.info("Stats Summary: Sent {} | Received {} | Avg: {} sent/s, {} recv/s | Topics: {}",
+                currSent, currReceived,
+                String.format("%.1f", currSent / elapsed),
+                String.format("%.1f", currReceived / elapsed),
+                stats.receivedTopicsCounts.size());
     }
 }

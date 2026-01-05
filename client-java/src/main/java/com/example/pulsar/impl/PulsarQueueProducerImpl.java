@@ -121,15 +121,15 @@ class PulsarQueueProducerImpl implements PulsarQueueProducer {
 
     // Retry logic for sending messages
     PulsarClientException lastSendException = new PulsarClientException("Did not attempt to send message");
+    List<String> messagesToSend = new ArrayList<>(messages);
 
     for (int i = 0; i < maxSendAttempts; i++) {
-        try {
-            // Asynchronous send for higher throughput
-            List<CompletableFuture<MessageId>> futures = new ArrayList<>(messages.size());
-            for (String msg : messages) {
-                futures.add(producer.sendAsync(msg.getBytes()));
-            }
+        List<CompletableFuture<MessageId>> futures = new ArrayList<>(messagesToSend.size());
+        for (String msg : messagesToSend) {
+            futures.add(producer.sendAsync(msg.getBytes()));
+        }
 
+        try {
             // Wait for all messages in the batch to be acknowledged
             CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get();
             return; // Success, exit method
@@ -138,6 +138,14 @@ class PulsarQueueProducerImpl implements PulsarQueueProducer {
             Thread.currentThread().interrupt();
             throw new PulsarClientException("Interrupted while sending messages", e);
         } catch (ExecutionException e) {
+            // Check if any futures completed successfully before retrying
+
+          messagesToSend = collectFailedMessages(futures, messagesToSend);
+            if (messagesToSend.isEmpty()) {
+                 // All actually succeeded despite the exception? (e.g. harmless error)
+                 return;
+            }
+
             Throwable cause = e.getCause();
             if (cause instanceof PulsarClientException) {
                 lastSendException = (PulsarClientException) cause;
@@ -146,7 +154,8 @@ class PulsarQueueProducerImpl implements PulsarQueueProducer {
             }
             
             if (i < maxSendAttempts - 1) {
-                log.warn("Failed to send batch to {}, retrying... ({}/{}) Error: {}", messageClass, i + 1, maxSendAttempts, lastSendException.getMessage());
+                log.warn("Failed to send {} messages to {}, retrying... ({}/{}) Error: {}", 
+                    messagesToSend.size(), messageClass, i + 1, maxSendAttempts, lastSendException.getMessage());
                 try {
                      long backoff = 100 * (long) Math.pow(2, i);
                      Thread.sleep(backoff);
@@ -159,6 +168,28 @@ class PulsarQueueProducerImpl implements PulsarQueueProducer {
     }
     
     throw lastSendException;
+  }
+
+  private List<String> collectFailedMessages(List<CompletableFuture<MessageId>> futures, List<String> messagesToSend) {
+      List<String> failedMessages = new ArrayList<>();
+      for (int j = 0; j < futures.size(); j++) {
+          CompletableFuture<MessageId> f = futures.get(j);
+          try {
+              // Ensure the future is finished (wait for it if allOf returned early due to exception)
+              if (!f.isDone()) {
+                   try {
+                       f.join();
+                   } catch (Exception ignored) {}
+              }
+              
+              if (f.isCompletedExceptionally()) {
+                   failedMessages.add(messagesToSend.get(j));
+              }
+          } catch (Exception ignored) {
+               failedMessages.add(messagesToSend.get(j));
+          }
+      }
+      return failedMessages;
   }
 
   @Override

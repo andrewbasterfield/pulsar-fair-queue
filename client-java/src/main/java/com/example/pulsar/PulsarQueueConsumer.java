@@ -7,6 +7,7 @@ import org.apache.pulsar.client.api.PulsarClientException;
 public interface PulsarQueueConsumer extends AutoCloseable {
     Message<byte[]> receive() throws PulsarClientException;
     Messages<byte[]> receiveBatch() throws PulsarClientException;
+    Messages<byte[]> receiveBatch(long timeout, java.util.concurrent.TimeUnit unit) throws PulsarClientException;
     void ack(Message<?> msg) throws PulsarClientException;
     void ack(Messages<?> msgs) throws PulsarClientException;
     void close() throws Exception;

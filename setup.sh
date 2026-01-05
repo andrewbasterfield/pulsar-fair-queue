@@ -16,5 +16,6 @@ set -xe
 $PULSAR_ADMIN namespaces create "$NAMESPACE" | true
 $PULSAR_ADMIN namespaces set-retention "$NAMESPACE" --size 0 --time 0
 $PULSAR_ADMIN namespaces set-message-ttl "$NAMESPACE" --messageTTL 0
-$PULSAR_ADMIN namespaces set-auto-topic-creation "$NAMESPACE" --enable --type partitioned --num-partitions 5
+$PULSAR_ADMIN namespaces set-auto-topic-creation "$NAMESPACE" --enable # --type partitioned --num-partitions 5 # don't enable partitioning with auto-creation & deletion, races
 $PULSAR_ADMIN namespaces set-inactive-topic-policies "$NAMESPACE" --enable-delete-while-inactive --max-inactive-duration 120s --delete-mode delete_when_subscriptions_caught_up
+#$PULSAR_ADMIN namespaces set-deduplication --enable "$NAMESPACE" # doesn't seem to help at all

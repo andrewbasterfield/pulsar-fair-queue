@@ -26,6 +26,10 @@ This project uses Docker Compose to run a local Pulsar cluster.
 - `consume.sh`: Runs the wildcard consumer.
 - `stats.sh`: Utility script to inspect topic statistics, backlogs, and consumers, helping to verify system state.
 
+### Client Implementations
+- `client-java/`: Contains a Java client implementation for interacting with Pulsar.
+- `client-go/`: Contains a Go client implementation for interacting with Pulsar.
+
 ## Configuration & Implementation Details
 
 This section details the specific Pulsar configurations that enable this dynamic workflow.
@@ -87,9 +91,7 @@ The consumer relies on a `Shared` subscription (configured in `consume.sh`). Thi
 *   **Strict Producer Contract (Data Loss Risk)**: The Zero-Retention policy imposes a strict requirement: a producer **must never** write to a topic without ensuring a subscription exists first. If this contract is violated (e.g., a producer writes to a new class-topic before the consumer detects it), messages are immediately and irretrievably dropped. This requires rigorous enforcement in the producer implementation.
 *   **Coupling & Configuration Drift**: The Producer must know the **exact** subscription name the Consumer will use. If these drift (e.g., consumer updates to v2 but producer uses v1), messages will accumulate on the old subscription (preventing topic cleanup) while the new subscription might see them (since `InitialPosition=Earliest` is enforced), but the original subscription remains as "junk".
 *   **Broker Load**: High churn (rapid creation/deletion) of topics can strain Zookeeper. The 120s inactivity buffer helps, but very bursty traffic could still be an issue.
-
-### Verdict
-The project is a solid Proof of Concept (PoC) for dynamic fair queueing. It works as intended but requires disciplined producer behavior (always ensure subscription exists) to be production-safe.
+*   **Partial Deletion & Inconsistent State**: When partitioned topics are automatically deleted due to inactivity, high system load or ZooKeeper latency can cause timeouts. This may result in a "partial deletion" where some partitions are removed while others remain (orphaned). These "zombie" partitions can prevent the topic from being cleanly re-created or fully deleted.
 
 ## Go Client Limitations
 
